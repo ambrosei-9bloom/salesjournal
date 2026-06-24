@@ -1,7 +1,8 @@
 """
 sales_journal_calendar.py
-Streamlit app — upload sales journal PDFs, visualise each transaction date
-on a calendar, and click any date to see itemised details.
+Streamlit app — upload sales journal PDFs, extract customer names automatically,
+visualise each transaction date on a calendar with per-customer color-coding,
+and click any date to see itemised details aggregated by customer.
 """
 
 import re
@@ -24,16 +25,29 @@ st.set_page_config(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
+# CUSTOMER COLOR PALETTE
+# ─────────────────────────────────────────────────────────────────────────────
+
+CUSTOMER_COLORS = [
+    {"bg": "#2563EB", "light": "#DBEAFE", "border": "#BFDBFE", "text": "#1E40AF", "badge": "#1D4ED8"},
+    {"bg": "#16A34A", "light": "#DCFCE7", "border": "#BBF7D0", "text": "#15803D", "badge": "#15803D"},
+    {"bg": "#DC2626", "light": "#FEE2E2", "border": "#FECACA", "text": "#B91C1C", "badge": "#B91C1C"},
+    {"bg": "#D97706", "light": "#FEF3C7", "border": "#FDE68A", "text": "#B45309", "badge": "#B45309"},
+    {"bg": "#7C3AED", "light": "#EDE9FE", "border": "#DDD6FE", "text": "#6D28D9", "badge": "#6D28D9"},
+    {"bg": "#0891B2", "light": "#CFFAFE", "border": "#A5F3FC", "text": "#0E7490", "badge": "#0E7490"},
+    {"bg": "#BE185D", "light": "#FCE7F3", "border": "#FBCFE8", "text": "#9D174D", "badge": "#9D174D"},
+]
+
+
+def get_customer_color(index: int) -> dict:
+    return CUSTOMER_COLORS[index % len(CUSTOMER_COLORS)]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-DATE_PATTERNS = [
-    r"\b(\d{1,2}/\d{1,2}/\d{2,4})\b",   # 1/7/26  or  01/07/2026
-    r"\b(\d{4}-\d{2}-\d{2})\b",          # 2026-01-07
-]
-
 def parse_date(raw: str) -> date | None:
-    """Try several common date formats and return a date object or None."""
     raw = raw.strip()
     for fmt in ("%m/%d/%y", "%m/%d/%Y", "%Y-%m-%d", "%-m/%-d/%y"):
         try:
@@ -43,24 +57,54 @@ def parse_date(raw: str) -> date | None:
     return None
 
 
-def extract_transactions(pdf_bytes: bytes) -> list[dict]:
+def extract_customer_name(text: str) -> str | None:
     """
-    Parse a sales-journal PDF and return a list of transaction dicts:
-      { date, invoice, description, amount }
+    Extract customer name from the Filter Criteria line:
+    'Filter Criteria includes: 1) Customer IDs from <Name> to <Name>'
+    Returns the name, or None if not found.
+    """
+    match = re.search(
+        r"Filter Criteria includes:.*?Customer IDs from (.+?) to \1",
+        text,
+        re.IGNORECASE,
+    )
+    if match:
+        return match.group(1).strip()
 
-    Strategy:
-    - Read every line.
-    - Lines that start with a date + account ID + invoice number are
-      "header" lines for a new invoice group.
-    - Subsequent indented lines carry description + credit/debit amounts.
-    - We collect the *credit* amount on the customer (11000) row as the
-      invoice total; individual product lines carry debit amounts.
+    # Fallback: grab first name even if from/to differ
+    match = re.search(
+        r"Filter Criteria includes:.*?Customer IDs from (.+?) to ",
+        text,
+        re.IGNORECASE,
+    )
+    if match:
+        return match.group(1).strip()
+
+    return None
+
+
+def extract_transactions(pdf_bytes: bytes) -> tuple[list[dict], str]:
+    """
+    Parse a sales-journal PDF.
+    Returns (transactions, customer_name).
+    Each transaction dict: { date, invoice, description, amount, customer }
     """
     transactions: list[dict] = []
+    customer_name: str = "Unknown Customer"
     current_date = None
     current_invoice = None
 
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+        # ── Extract customer name from full text (usually on page 1) ──
+        full_text = ""
+        for page in pdf.pages:
+            full_text += (page.extract_text() or "") + "\n"
+
+        extracted_name = extract_customer_name(full_text)
+        if extracted_name:
+            customer_name = extracted_name
+
+        # ── Parse transactions page by page ──
         for page in pdf.pages:
             text = page.extract_text() or ""
             for line in text.splitlines():
@@ -68,8 +112,7 @@ def extract_transactions(pdf_bytes: bytes) -> list[dict]:
                 if not line:
                     continue
 
-                # ── Try to detect a header line: date + account + invoice ──
-                # e.g.  "1/7/26 23100 2601041 DC: DC Sales Tax 18.30"
+                # Header line: date + account + 7-digit invoice + desc + amount
                 header_match = re.match(
                     r"^(\d{1,2}/\d{1,2}/\d{2,4})\s+\d+\s+(\d{7})\s+(.+?)\s+([\d,]+\.\d{2})\s*$",
                     line,
@@ -80,42 +123,36 @@ def extract_transactions(pdf_bytes: bytes) -> list[dict]:
                     if parsed:
                         current_date = parsed
                         current_invoice = invoice
-                        transactions.append(
-                            {
-                                "date": current_date,
-                                "invoice": current_invoice,
-                                "description": desc.strip(),
-                                "amount": float(amount_str.replace(",", "")),
-                            }
-                        )
+                        transactions.append({
+                            "date": current_date,
+                            "invoice": current_invoice,
+                            "description": desc.strip(),
+                            "amount": float(amount_str.replace(",", "")),
+                            "customer": customer_name,
+                        })
                     continue
 
-                # ── Detail line: account + description + amount ──
-                # e.g.  "40200 Oversize Color Light WO#4929 300.00"
+                # Detail line: 5-digit account + desc + amount
                 detail_match = re.match(
                     r"^(\d{5})\s+(.+?)\s+([\d,]+\.\d{2})\s*$",
                     line,
                 )
                 if detail_match and current_date and current_invoice:
                     acct, desc, amount_str = detail_match.groups()
-                    # Skip the customer receivable line (11000) — it's the total,
-                    # not a purchased item.
                     if acct == "11000":
                         continue
-                    transactions.append(
-                        {
-                            "date": current_date,
-                            "invoice": current_invoice,
-                            "description": desc.strip(),
-                            "amount": float(amount_str.replace(",", "")),
-                        }
-                    )
+                    transactions.append({
+                        "date": current_date,
+                        "invoice": current_invoice,
+                        "description": desc.strip(),
+                        "amount": float(amount_str.replace(",", "")),
+                        "customer": customer_name,
+                    })
 
-    return transactions
+    return transactions, customer_name
 
 
 def group_by_date(transactions: list[dict]) -> dict[date, list[dict]]:
-    """Return {date: [transaction, ...]} mapping."""
     grouped: dict[date, list[dict]] = defaultdict(list)
     for t in transactions:
         grouped[t["date"]].append(t)
@@ -126,20 +163,37 @@ def daily_totals(grouped: dict[date, list[dict]]) -> dict[date, float]:
     return {d: sum(t["amount"] for t in txns) for d, txns in grouped.items()}
 
 
+def customers_on_date(grouped: dict[date, list[dict]], d: date) -> list[str]:
+    """Return unique customer names present on a given date."""
+    if d not in grouped:
+        return []
+    return list(dict.fromkeys(t["customer"] for t in grouped[d]))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CALENDAR RENDERER
 # ─────────────────────────────────────────────────────────────────────────────
 
-def render_calendar(year: int, month: int, sale_dates: set[date], selected: date | None):
+def render_calendar(
+    year: int,
+    month: int,
+    grouped: dict[date, list[dict]],
+    customer_color_map: dict[str, dict],
+    selected: date | None,
+):
     """
     Render one month as an HTML table.
-    Dates with sales get a highlighted cell with a button-like style.
+    Dates with sales show colored dots per customer.
+    Multi-customer dates show multiple dots.
     """
-    cal = calendar.Calendar(firstweekday=6)  # Sunday first
+    cal = calendar.Calendar(firstweekday=6)
     weeks = cal.monthdatescalendar(year, month)
 
     day_names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
-    header = "".join(f"<th style='padding:6px 10px;color:#888;font-size:12px;'>{d}</th>" for d in day_names)
+    header = "".join(
+        f"<th style='padding:6px 10px;color:#888;font-size:12px;font-weight:600;'>{d}</th>"
+        for d in day_names
+    )
 
     rows = ""
     for week in weeks:
@@ -147,23 +201,40 @@ def render_calendar(year: int, month: int, sale_dates: set[date], selected: date
         for day in week:
             if day.month != month:
                 cells += "<td style='padding:8px;'></td>"
-            elif day in sale_dates:
+            elif day in grouped:
+                customers = customers_on_date(grouped, day)
                 is_selected = selected == day
-                bg = "#2563EB" if is_selected else "#DBEAFE"
-                color = "#fff" if is_selected else "#1E40AF"
-                border = "2px solid #2563EB" if is_selected else "2px solid #BFDBFE"
+
+                # Determine cell background: use first customer's color
+                first_color = customer_color_map.get(customers[0], CUSTOMER_COLORS[0])
+                cell_bg = first_color["bg"] if is_selected else first_color["light"]
+                cell_border = f"2px solid {first_color['bg']}"
+                day_color = "#fff" if is_selected else first_color["text"]
+
+                # Build customer dots
+                dots = ""
+                for cust in customers:
+                    c = customer_color_map.get(cust, CUSTOMER_COLORS[0])
+                    dot_color = "#fff" if is_selected else c["bg"]
+                    dots += (
+                        f"<span style='display:inline-block;width:6px;height:6px;"
+                        f"border-radius:50%;background:{dot_color};margin:0 1px;'></span>"
+                    )
+
                 cells += (
                     f"<td style='padding:6px;text-align:center;'>"
-                    f"<div style='background:{bg};color:{color};border:{border};"
-                    f"border-radius:50%;width:36px;height:36px;display:flex;"
-                    f"align-items:center;justify-content:center;"
-                    f"font-weight:bold;font-size:14px;cursor:pointer;margin:auto;'>"
-                    f"{day.day}</div></td>"
+                    f"<div style='background:{cell_bg};border:{cell_border};"
+                    f"border-radius:10px;width:42px;min-height:42px;display:flex;"
+                    f"flex-direction:column;align-items:center;justify-content:center;"
+                    f"cursor:pointer;margin:auto;padding:4px 2px;'>"
+                    f"<span style='font-weight:bold;font-size:14px;color:{day_color};'>{day.day}</span>"
+                    f"<div style='margin-top:3px;'>{dots}</div>"
+                    f"</div></td>"
                 )
             else:
                 cells += (
                     f"<td style='padding:6px;text-align:center;'>"
-                    f"<div style='width:36px;height:36px;display:flex;"
+                    f"<div style='width:42px;height:42px;display:flex;"
                     f"align-items:center;justify-content:center;"
                     f"font-size:14px;color:#374151;margin:auto;'>{day.day}</div></td>"
                 )
@@ -184,6 +255,10 @@ def render_calendar(year: int, month: int, sale_dates: set[date], selected: date
 
 if "transactions" not in st.session_state:
     st.session_state.transactions = []
+if "customer_color_map" not in st.session_state:
+    st.session_state.customer_color_map = {}
+if "customer_names" not in st.session_state:
+    st.session_state.customer_names = []
 if "selected_date" not in st.session_state:
     st.session_state.selected_date = None
 if "view_year" not in st.session_state:
@@ -192,7 +267,7 @@ if "view_month" not in st.session_state:
     st.session_state.view_month = date.today().month
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SIDEBAR — upload
+# SIDEBAR
 # ─────────────────────────────────────────────────────────────────────────────
 
 with st.sidebar:
@@ -206,27 +281,58 @@ with st.sidebar:
     if uploaded:
         if st.button("📊 Process Journals", use_container_width=True):
             all_txns: list[dict] = []
+            found_customers: list[str] = []
+
             with st.spinner("Extracting transactions…"):
                 for f in uploaded:
-                    txns = extract_transactions(f.read())
+                    txns, cust_name = extract_transactions(f.read())
                     all_txns.extend(txns)
+                    if cust_name not in found_customers:
+                        found_customers.append(cust_name)
+
+            # Assign colors to each unique customer
+            color_map = {
+                name: get_customer_color(i)
+                for i, name in enumerate(found_customers)
+            }
+
             st.session_state.transactions = all_txns
+            st.session_state.customer_color_map = color_map
+            st.session_state.customer_names = found_customers
             st.session_state.selected_date = None
+
             if all_txns:
-                # Jump calendar to earliest transaction month
                 earliest = min(t["date"] for t in all_txns)
                 st.session_state.view_year = earliest.year
                 st.session_state.view_month = earliest.month
+
             st.success(f"Loaded {len(all_txns)} line items from {len(uploaded)} file(s).")
 
     if st.session_state.transactions:
         st.divider()
-        grouped = group_by_date(st.session_state.transactions)
-        totals = daily_totals(grouped)
-        st.metric("Total Sale Days", len(grouped))
-        st.metric("Grand Total", f"${sum(totals.values()):,.2f}")
+
+        # ── Customer legend ──
+        st.markdown("**Customers**")
+        for name in st.session_state.customer_names:
+            c = st.session_state.customer_color_map.get(name, CUSTOMER_COLORS[0])
+            cust_txns = [t for t in st.session_state.transactions if t["customer"] == name]
+            cust_total = sum(t["amount"] for t in cust_txns)
+            st.markdown(
+                f"<div style='display:flex;align-items:center;gap:8px;margin-bottom:6px;'>"
+                f"<span style='display:inline-block;width:12px;height:12px;border-radius:50%;"
+                f"background:{c['bg']};flex-shrink:0;'></span>"
+                f"<span style='font-size:13px;font-weight:600;color:#111;'>{name}</span>"
+                f"</div>"
+                f"<div style='margin-left:20px;font-size:12px;color:#666;margin-bottom:10px;'>"
+                f"${cust_total:,.2f} across {len(set(t['date'] for t in cust_txns))} days</div>",
+                unsafe_allow_html=True,
+            )
 
         st.divider()
+        grouped_all = group_by_date(st.session_state.transactions)
+        totals_all = daily_totals(grouped_all)
+        st.metric("Total Sale Days", len(grouped_all))
+        st.metric("Grand Total", f"${sum(totals_all.values()):,.2f}")
         st.caption("Click a highlighted date on the calendar to see details.")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -242,6 +348,7 @@ if not st.session_state.transactions:
 grouped = group_by_date(st.session_state.transactions)
 totals = daily_totals(grouped)
 sale_dates = set(grouped.keys())
+color_map = st.session_state.customer_color_map
 
 # ── Month navigator ───────────────────────────────────────────────────────────
 col_prev, col_title, col_next = st.columns([1, 4, 1])
@@ -265,15 +372,14 @@ with col_title:
 
 st.divider()
 
-# ── Calendar grid + date picker ───────────────────────────────────────────────
+# ── Calendar grid ─────────────────────────────────────────────────────────────
 year = st.session_state.view_year
 month = st.session_state.view_month
 
-# Show the static HTML calendar
-calendar_html = render_calendar(year, month, sale_dates, st.session_state.selected_date)
+calendar_html = render_calendar(year, month, grouped, color_map, st.session_state.selected_date)
 st.markdown(calendar_html, unsafe_allow_html=True)
 
-# Date selector for highlighted days (replaces click since Streamlit is stateless)
+# ── Date selector ─────────────────────────────────────────────────────────────
 month_sale_dates = sorted(d for d in sale_dates if d.year == year and d.month == month)
 
 if month_sale_dates:
@@ -302,22 +408,45 @@ if st.session_state.selected_date:
     st.divider()
     st.subheader(f"🗓 {sel.strftime('%A, %B %d, %Y')}")
 
-    # Group by invoice
-    inv_groups: dict[str, list[dict]] = defaultdict(list)
+    # Group transactions by customer first, then by invoice
+    by_customer: dict[str, list[dict]] = defaultdict(list)
     for t in txns:
-        inv_groups[t["invoice"]].append(t)
+        by_customer[t["customer"]].append(t)
 
-    for invoice, items in inv_groups.items():
-        inv_total = sum(i["amount"] for i in items)
-        with st.expander(f"Invoice #{invoice} — ${inv_total:,.2f}", expanded=True):
-            for item in items:
-                cols = st.columns([5, 1])
-                cols[0].write(item["description"])
-                cols[1].write(f"**${item['amount']:,.2f}**")
+    for customer, cust_txns in by_customer.items():
+        c = color_map.get(customer, CUSTOMER_COLORS[0])
+        cust_day_total = sum(t["amount"] for t in cust_txns)
 
+        # Customer header
+        st.markdown(
+            f"<div style='background:{c[\"light\"]};border-left:4px solid {c[\"bg\"]};"
+            f"border-radius:6px;padding:10px 16px;margin-bottom:8px;'>"
+            f"<span style='font-size:16px;font-weight:700;color:{c[\"text\"]};'>"
+            f"👤 {customer}</span>"
+            f"<span style='float:right;font-size:15px;font-weight:600;color:{c[\"text\"]};'>"
+            f"${cust_day_total:,.2f}</span></div>",
+            unsafe_allow_html=True,
+        )
+
+        # Group by invoice within this customer
+        inv_groups: dict[str, list[dict]] = defaultdict(list)
+        for t in cust_txns:
+            inv_groups[t["invoice"]].append(t)
+
+        for invoice, items in inv_groups.items():
+            inv_total = sum(i["amount"] for i in items)
+            with st.expander(f"Invoice #{invoice} — ${inv_total:,.2f}", expanded=True):
+                for item in items:
+                    cols = st.columns([5, 1])
+                    cols[0].write(item["description"])
+                    cols[1].write(f"**${item['amount']:,.2f}**")
+
+        st.markdown("<div style='margin-bottom:16px;'></div>", unsafe_allow_html=True)
+
+    # Day total footer
     st.markdown(
         f"<div style='background:#F0FDF4;border:1px solid #86EFAC;border-radius:8px;"
-        f"padding:12px 20px;margin-top:12px;font-size:18px;font-weight:bold;color:#15803D;'>"
-        f"Day Total: ${day_total:,.2f}</div>",
+        f"padding:12px 20px;margin-top:4px;font-size:18px;font-weight:bold;color:#15803D;'>"
+        f"Day Total (all customers): ${day_total:,.2f}</div>",
         unsafe_allow_html=True,
     )
