@@ -418,12 +418,15 @@ if st.session_state.selected_date:
         cust_day_total = sum(t["amount"] for t in cust_txns)
 
         # Customer header
+        c_light = c['light']
+        c_bg = c['bg']
+        c_text = c['text']
         st.markdown(
-            f"<div style='background:{c[\"light\"]};border-left:4px solid {c[\"bg\"]};"
+            f"<div style='background:{c_light};border-left:4px solid {c_bg};"
             f"border-radius:6px;padding:10px 16px;margin-bottom:8px;'>"
-            f"<span style='font-size:16px;font-weight:700;color:{c[\"text\"]};'>"
+            f"<span style='font-size:16px;font-weight:700;color:{c_text};'>"
             f"👤 {customer}</span>"
-            f"<span style='float:right;font-size:15px;font-weight:600;color:{c[\"text\"]};'>"
+            f"<span style='float:right;font-size:15px;font-weight:600;color:{c_text};'>"
             f"${cust_day_total:,.2f}</span></div>",
             unsafe_allow_html=True,
         )
